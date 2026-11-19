@@ -1,0 +1,15 @@
+[package]
+name = "spike-state-machine"
+version = "0.1.0"
+description = "Research spike: the GDK state machine, one runnable experiment at a time"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+dotenvy = "0.15.7"
+goose-agent = "=0.1.0-alpha.11"
+goose-providers = { version = "=0.1.0-alpha.11", features = ["rustls-tls"] }
+serde_json = "1.0.149"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
+tokio-util = "0.7"

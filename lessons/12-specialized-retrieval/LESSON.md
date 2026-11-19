@@ -1,0 +1,343 @@
+# Lesson 12 — Retrieve specialized educational evidence
+
+## Goal and boundary
+
+Extend the supplied learning partner with a narrow, read-only search of locally prepared book passages. Explain why an agent needs external evidence, observe a source-grounded answer, and inspect whether its citations actually support its claims. Day trading remains the teaching vehicle, not a trading recommendation or permission to build order execution.
+
+The instructor has authorized this integration using the **provisional three-PDF, 511-passage test collection**. This is not a final corpus freeze, a three-model comparison, EPUB integration, or proof of retrieval quality. Historical planning/preparation-only restrictions in [PLAN.md](PLAN.md) and [the handoff](../final-lessons-handoff.md) describe earlier phases; this lesson covers the separately authorized runtime continuation. Read [README](../../README.md) for the current roadmap.
+
+**Status:** complete (instructor completion decision, 2026-11-11; Lessons 1–12). The instructor verified the root and this lesson's reference mirror as byte-identical, making the 2026-11-11 grounding acknowledgment-enforcement pass below the lesson's final validated state. The provisional three-PDF collection, the deferred corpus-freeze/policy-comparison decisions, and all recorded validation limitations remain as documented below.
+
+The instructor supplies the [complete reference source tree](src/), retrieval support, and [three editable teaching files](content/) before class. Root `src/` is an ephemeral exercise copy, not the authoritative Lesson 12 reference; the combined Lessons 12–14 modularization finishes with Lesson 14 active at root. Activate this lesson explicitly before running it. Predict → run → explain → tweak → run again. There are **no missing Rust scaffolding exercises** and no requirement to write ingestion, database, async, or presentation machinery during class.
+
+## Concepts introduced
+
+An **embedding** is a model-produced numeric representation of text. The application embeds the learner's search question so it can compare that question with already embedded passages. This does not retrain the tutor.
+
+An **embedding space** is the complete compatible model and preprocessing contract, not merely a vector length. Passage and query embeddings must use the same selected model, runtime profile, formatting, dimensions, and normalization. Two 1,024-number vectors are not automatically comparable.
+
+**Retrieval** selects candidate source passages to accompany the tutor's next inference. A **passage** or **chunk** is a bounded portion of extracted source text. A **collection** groups passages belonging to one preparation/profile. Retrieval adds evidence to the existing conversation; it does not replace the learner's consented learning record.
+
+**Provenance** describes where evidence came from: stable passage identity, document/source identity, physical page locations, preparation/profile and available metadata. A **citation** is a reference to that evidence. Provenance lets an instructor inspect a claim instead of trusting fluent prose.
+
+**Cosine distance** measures the difference in direction between embeddings; lower distance means closer vectors. It is not a probability of relevance, correctness, or mastery. **HNSW** is an approximate nearest-neighbor indexing algorithm used to find candidates efficiently. It is the index, not the distance metric; a small database may still be scanned by the PostgreSQL planner.
+
+The **read-only retrieval boundary** is application code that accepts a narrow search query, uses approved local services and parameters, and returns bounded evidence. It is needed because a model request is untrusted input, not permission to execute arbitrary SQL or network requests.
+
+A **source-grounded answer** connects a specific claim to an actually returned excerpt. **Source-grounded feedback** compares a learner's particular answer with that evidence and explains a supported distinction. Neither is a validated assessment of trading competence. There are no expert-authored rubrics here; seeing a tutor explanation is not evidence of learner understanding.
+
+**Grounding acknowledgment** is the tutor's visible use of the excerpts supplied for its turn: ending each sentence that draws on an excerpt with that excerpt's exact `[source:<id>]` marker, or stating plainly that the excerpts did not support the answer, ending that one sentence with the exact marker `[source:none]`. Models are not trusted to judge what retrieved information is relevant, so the application — not the model — classifies every grounded reply as cited, declined, or silently ignored. A reply that neither cites nor declines is **non-compliant**: the application appends one authored reminder as a user message and asks the tutor to answer again, exactly once. One re-ask keeps a single bounded correction inside the turn instead of letting overconfidence silently drop supplied evidence.
+
+## Prerequisites and supplied setup
+
+Complete Lesson 11's consent, proposal, approval and fresh-Session model. Keep its calculator, streamed Events, effect handling and GDK-owned loop. Be able to distinguish displayed activity from saved messages and model-generated proposals from local approval.
+
+Before class, the instructor supplies and verifies:
+
+- The pinned Rust toolchain and locked root dependencies, and the complete Lesson 12 source/support files.
+- A working local tutor provider. The bundled JSON remains a replaceable default; under the existing limited CLI convention, the application selects the first declared model and accepts an optional positional provider path.
+- PostgreSQL 18/pgvector 0.8.7 with the populated `harrier-llamacpp-test-511-v1` collection and a separate reader role.
+- The matching local Microsoft Harrier OSS v1 0.6B F16 GGUF/llama.cpp embedding service on port 9999. It is separate from the tutor service on the bundled configuration's port 8080.
+- Authorized access to the private source material and artifacts. A Git clone does not contain the books, extracted passages, embeddings or database contents. The instructor-supplied local reader credential is now explicitly included in the source defaults; other private credentials remain outside Git.
+
+The instructor follows [DATABASE-SETUP.md](DATABASE-SETUP.md) for startup, loading, identity checks, reader query and shutdown, and [RETRIEVAL.md](../../embedding-code/RETRIEVAL.md) for preparation evidence. **Learners do not install PostgreSQL, convert models, extract books, design chunks, or tune indexes in this lesson.** The three PDFs are sufficient for this provisional integration; EPUB preparation is future corpus work, not a blocker requiring learners to implement it now.
+
+Activate the **complete source tree**, including the retrieval test subdirectory, from a repository-root Bash shell. This replaces the ephemeral exercise; preserve unrelated work outside `src/`. No backup/restore or final hello-world reset is required:
+
+```bash
+rm -rf src
+mkdir src
+cp -R lessons/12-specialized-retrieval/src/. src/
+```
+
+Then, from a prepared repository-root Bash shell:
+
+```bash
+umask 077
+cargo run -- custom_aa_llama_qwen3_6-35b.json
+```
+
+The three local classroom defaults are `const` values at the top of `src/main.rs`: `RETRIEVAL_DATABASE_URL` uses the instructor-supplied `retrieval_reader` connection to `127.0.0.1:55432/harrier`, `HARRIER_URL` is `http://127.0.0.1:9999`, and `TUTOR_URL` is `http://127.0.0.1:8080`. No exports or private connection file are required for these defaults. Existing environment variables (including values loaded by `dotenvy` from `.env`) override them. For another prepared database, set `RETRIEVAL_DATABASE_URL` to its reader connection, never the loader/admin connection. The supplied password is **plaintext in source and compiled binaries**; this is an explicit local classroom convenience, not secret storage or a production credential pattern. Rotate/replace it for any other deployment and do not project the credential-bearing source. Defaults do not start services or bypass runtime/profile/reader validation. `TUTOR_URL` selects the tokenizer origin and must match the tutor provider JSON; it does not override generation configuration.
+
+
+The tutor JSON must select a literal-loopback OpenAI-compatible service. The application rejects nonempty proxy environment variables and constrains provider redirects to the same local origin; the retrieval HTTP client disables proxies and redirects. `TUTOR_URL` must exactly match the provider origin (trailing slash aside) and expose the llama.cpp `/tokenize` API. This is a deliberate Lesson 12 local-service restriction, not general remote-provider support.
+
+If the reader readiness check rejects inherited temporary-table privileges on an older prepared database, the instructor applies `REVOKE TEMPORARY ON DATABASE harrier FROM PUBLIC;` using the admin preparation shell. The supplied `embedding-code/postgres.sh up` now includes that restriction. Do not weaken the reader check or use admin credentials in the learner application. No corpus reload is required.
+
+The embedding client verifies the prepared GGUF/profile using the local model path reported by the running server; no extra `HARRIER_GGUF` variable is assumed. The preparation guide describes the verified file/hash checks.
+
+Run checks from root as maintenance, not Rust fill-ins:
+
+```bash
+cargo fmt --check
+cargo check
+cargo clippy --all-targets
+cargo test
+```
+
+These commands check deterministic code boundaries; actual integration outcomes are recorded below. Live datastore, embedding and tutor evidence must be recorded separately. If a service or the authorized private corpus is unavailable, ask the instructor; synthetic tests do not silently substitute for this live run.
+
+To reactivate the supplied code after a classroom tweak, repeat the complete recursive activation above. Copying only `main.rs` and `retrieval.rs` leaves out required support and tests.
+
+The shared manifest now adds async `reqwest` 0.13.5 with JSON/rustls/stream support, `tokio-postgres` 0.7 with JSON integration, and `sha2` 0.10. Cargo.lock fixes the actual resolved versions. The GDK, RMCP, toolchain, provider JSON and earlier references are unchanged. The separate preparation package still uses its own blocking clients; those are not called inside the agent tool handler.
+
+## Supplied source map and teaching reading path
+
+A **module** is a named part of this Rust application that groups related code. Local modules let us keep the agent's decisions visible while reading already-taught calculation and supplied UI/storage mechanics separately. They are files in this lesson, not a shared course library, another agent, or a new execution loop. Every Rust source starts with `// Lesson 12`.
+
+| Source | Responsibility |
+| --- | --- |
+| [main.rs](src/main.rs) | Context loading/prompt assembly and consent; Session/runtime/Effects; concurrent Event consumption; machine assembly/run/cancellation; tool registration/dispatch/allowlists/limits; forced per-turn source grounding; application-side acknowledgment classification with one escalated re-run; per-request exact system prompt capture via a request-preparer hook; current-turn citation inspection; genuine-learner-source validation and post-run approval sequence. |
+| [retrieval.rs](src/retrieval.rs) | Cohesive local read-only adapter: strict query, endpoint/profile/privilege/provenance checks, embedding/SQL, tokenizer accounting, evidence clipping and connection-driver cancellation/Drop guards. |
+| [calculator.rs](src/calculator.rs) | Previously taught exact-decimal calculation, strict arguments and capability schema; two local tests. |
+| [learning_record.rs](src/learning_record.rs) | Record categories/proposal shape/schema, bounded file reading/appending and default-no confirmation-input mechanics; two local tests. It does not decide learner-source validity or when approval may happen. |
+| [chooser.rs](src/chooser.rs) | Supplied arrow/Enter chooser, numbered fallback, input and raw-mode cleanup. |
+| [presentation.rs](src/presentation.rs) | Palette, independent terminal gating and streaming `TerminalProse` formatting; two local tests. Event consumption stays in main. |
+| [provider_setup.rs](src/provider_setup.rs) | Positional provider-path handling and first configured model selection. Local tutor policy/transport checks stay in main. |
+| [diagnostics.rs](src/diagnostics.rs) | Plain Markdown log writing, complete Session rendering and presentation sanitization; two local tests. It is never learner memory. |
+| [tests.rs](src/tests.rs) | Application/runtime/Event/dispatch/memory/citation/grounding/acknowledgment tests and shared test helpers; includes one opt-in live test that forced per-turn grounding prepares turn state without touching conversation history. |
+| [retrieval/tests.rs](src/retrieval/tests.rs) | Adapter-local query/URL/database/vector/profile/provenance/serialization/cancellation tests, plus one opt-in actual-service smoke test. |
+
+These declarations in main name supplied local files; learners do not reconstruct them:
+
+```rust
+mod calculator;
+mod chooser;
+mod diagnostics;
+mod learning_record;
+mod presentation;
+mod provider_setup;
+mod retrieval;
+#[cfg(test)]
+mod tests;
+```
+
+**Teaching reading path:**
+
+1. In main, read `LessonContext::load`/`prompt_parts` and `run_learning_partner`: editable context, explicit consent, fresh selection versus retained replies, and local-service startup policy.
+2. Stay in main for `ChatSession`, `ChatRuntime`, `ChatEffect`, `run_turn` and `display_events`: saving Effects is distinct from consuming Events concurrently. Follow timeout/cancellation, sender closure, draining and partial diagnostics before inspection; module extraction changes none of that order.
+3. Trace main's one ToolProvider registration, `SafeTools`, `RunLimit` and the forced per-turn grounding path: `prepare_turn_grounding` retrieves before `run_turn` on every genuine learner turn, and `select_grounding` filters SQL's top five candidates to at most three above the similarity threshold. Then open retrieval's cohesive adapter for the bounded service/SQL/provenance path; do not split that algorithm into classroom scaffolding.
+4. Return to `inspect_turn`/`inspect_citations` in main: only the `source-grounding` excerpts selected for this learner turn authorize citation IDs, and only through the tutor actually citing them. Membership in the selected set does not certify semantic support.
+5. Read `LossToolProvider`, `parse_record_proposal` and `approve_record_proposals` in main. The handler only prepares a proposal; its quotation must come from an actual learner reply, not kickoff/tutor/tool/source text. A successful final answer and inspection precede local default-no approval, decision logging, the append call, current Session record refresh and complete post-approval diagnostics. Storage mechanics in `learning_record` cannot authorize that sequence.
+6. Consult calculator/chooser/presentation/provider_setup/diagnostics support only as needed. Finish with application and retrieval child tests plus inline support tests: default execution has 46 deterministic tests and two ignored live tests. Synthetic fixtures do not replace real services or human teaching review.
+
+## 12.1 — Predict which question needs evidence
+
+Select **Getting started in day trading**. Decide separately whether to use optional memory; blank consent means no. The opening and any consented resumption remain a normal short learning conversation.
+
+Contrast two questions before running:
+
+1. “What is a bid-ask spread?” Grounding still runs — the application retrieves before every genuine learner turn — but the tutor may answer from course-authored context when the excerpts do not support the question.
+2. “What do the supplied books say about liquidity and the bid-ask spread?” This requests source-grounded support; predict `[source:<id>]` markers beside supported claims.
+
+Both questions run the same forced retrieval; the learner cannot switch it off and the model cannot request a search. Predict how the answers differ in **citation use**, not in whether a search occurs. There is no "missing search" finding in this lesson — a turn with no qualifying excerpt reports `no_evidence`, and a failed retrieval reports `unavailable` with a learner-visible warning; neither is hidden. A grounded turn where the tutor neither cites nor declines is also visible: the application warns the learner, records the classification, and re-asks the tutor once. A decline sentence is reported to the learner as a plain source note, not hidden. The learner terminal should stay simple: `Tutor:`, `Learner >`, a warning only when grounding is unavailable or a grounded reply is silently ignored, a citation footer whenever the tutor actually cites IDs, and short tutor prose. No application-added protocol fences, actor arrows, correlation IDs, raw arguments, vectors or Session dumps belong in this dialogue. An evidence marker is a source citation, not a tool request ID.
+
+Do not promise exact model wording, a specific winning book, or an exact result count. SQL returns at most five candidates; the application keeps at most three above the similarity threshold, and a turn whose candidates all fall below it answers without markers. A nearest-neighbor result is still only a candidate.
+
+## 12.2 — Explain the forced per-turn grounding round trip
+
+Lesson 12 gives the model **no search tool**. There is no `search_educational_passages` tool request and no retrieval correlation ID. Instead the application performs **forced per-turn source grounding**: one retrieval that the application initiates before the machine runs, on every genuine learner turn. **The learner's own input is the query** — the model cannot craft, expand, or repeat a query, choose a result count, or re-search when evidence disappoints. A **prompt part** rides the same per-request channel as lesson context: it reaches this turn's inference requests only and is never saved into conversation history, so compaction and learner-quote provenance are unaffected.
+
+Narrate the current flow:
+
+1. The learner submits a message; blank input, `/finish` and `/quit` are filtered and the reply is appended to conversation history. The application-authored kickoff question grounds nothing.
+2. `prepare_turn_grounding` runs before the machine starts: one retrieval per genuine learner turn, never a model decision.
+3. The retrieval adapter validates the query (the learner input) and the selected collection/runtime contract.
+4. Rust prepares Harrier's query instruction and obtains a matching local query embedding. PostgreSQL does not embed text.
+5. A parameterized, read-only PostgreSQL query searches the fixed collection using cosine distance and the supplied HNSW index, returning at most five ranked candidates with provenance, citation IDs, cosine similarity (`1 - distance`) and clipping information.
+6. `select_grounding` keeps candidates at or above the similarity threshold (0.55, with a validated `GROUNDING_MIN_SIMILARITY` override) and takes at most three. Empty selection reports `no_evidence`; a failed retrieval degrades to `unavailable` with the failure fully recorded and the tutor warned learner-side.
+7. The selected excerpts travel as this turn's `source-grounding` prompt part, placed **first** so the enforcement contract is not buried under the long lesson context; the GDK re-evaluates saved state and the tutor streams a final answer. The part states the acknowledgment rule in the model's own instruction channel: cite each excerpt used with its exact `[source:<id>]` marker, or decline in one sentence ending with the exact `[source:none]` marker; a reply that does neither is non-compliant and will be re-asked.
+8. After the run, the application — never the model — classifies the reply's acknowledgment by scanning its citations against the excerpts selected for this turn: `cited`, `declined` (`[source:none]`), `silently ignored`, or `no excerpts supplied`. The classification is recorded in diagnostics and shown to the learner.
+9. On a silent ignore the application appends one authored reminder as a user message — it never retries twice — then runs the turn once more under the same bounds; the reminder is excluded from learner-quote provenance so an escalated reply cannot validate a memory proposal by quoting it. Any memory proposal from the first attempt is approved before that append, because the proposal window tracks the latest user message.
+10. `citation_footer` lists provenance for the IDs the tutor actually cited. Only afterward can a successful memory proposal receive a separate local save decision.
+
+Because the model is not trusted, its view of relevance is inspectable: every genuine inference request's exact system prompt is captured through a request-preparer hook and dumped to diagnostics, headed by attempt (`initial run`, `escalated re-run`) and request number, so an instructor can read precisely what instruction text the tutor received, including where the grounding contract sat.
+
+A **ToolProvider** supplies tool definitions and implementations to the GDK. Lesson 12 keeps a single provider — the calculator plus the conditional consented-proposal definition; retrieval is not a tool. In `goose-agent = 0.1.0-alpha.11`, the registration method is:
+
+```rust
+pub fn with_provider(mut self, provider: Arc<dyn ToolProvider<S>>) -> Self
+```
+
+This is a focused SDK signature, not a line to fill in. Read the supplied application's registration and SafeTools wrapper. The SDK advertises definitions, dispatches known requests and constructs correlated responses; the application owns validation, privileges, the grounding threshold/budget and rejection policy. In this exact release the SDK filters unknown names and does not impose the course's request cap, so removing SafeTools would lose safeguards.
+
+`StateMachine::run` still owns within-turn iteration: load state, select the first applicable step, apply Effects, and reload/re-evaluate. **Effects** describe saved changes; **Events** carry live presentation activity through the Emitter while the run executes. Grounding happens before the run, so it issues no tool request and emits no tool Event; its diagnostics are logged directly by the application. Supplied async HTTP/database support keeps service waits inside ordinary async machinery; attendees need not write concurrency infrastructure.
+
+### Bounds and what they mean
+
+A **token budget** limits model-token contribution, not character or word count. The application counts actual tokens for the serialized evidence, including provenance JSON, rather than estimating from excerpt length. The supplied adapter uses the **actual tutor tokenizer** through its local `/tokenize` endpoint for excerpts and the complete compact response JSON, including the `used_tokens` field itself. Harrier's tokenizer separately preflights the embedding input. Neither counting step is a declaration of the tutor's full context capacity.
+
+| Boundary | Application-owned limit |
+| --- | --- |
+| Grounding query | The learner input; nonblank; 2,000 UTF-8 bytes maximum (oversize degrades the turn to `unavailable`) |
+| Candidate results | At most five from SQL, fixed by the application |
+| Selected statements | At most three above the 0.55 similarity threshold |
+| Each returned excerpt | At most 1,000 tokens; clipping labeled |
+| Grounding evidence per learner turn | One forced search, 2,500 actual tokens caller-owned, including provenance/JSON serialization |
+| Each embedding/tokenizer HTTP request | 15 seconds |
+| SQL wait | 5 seconds, including server-side statement timeout |
+| Tool requests together (calculator/proposal) | Four requests per turn, not four per provider |
+| Within-run work | Eight applied work passes, plus a possible terminal halt batch |
+| Entire run | 180 seconds |
+
+The grounding budget is caller-owned: the tutor passes 2,500 actual tokens per turn, while the calibration harness passes a large value so every candidate can be inspected. There is one forced search per turn — no second search can be requested within the turn, so no cross-call evidence ledger is needed. Calculator and proposal tool requests still share the aggregate tool limits, and failed tool calls return correlated sanitized errors rather than evidence. Commands cannot overlap runs in this single-process workflow. These bounds limit new evidence in one turn; they do not compact accumulated history or guarantee that an arbitrarily long conversation fits the tutor. HTTP requests have a 15-second deadline each; several tokenizer calls can occur within the grounding wait, which precedes the 180-second run bound. SQL also has a server-side statement timeout. An owned connection-driver task is aborted on drop, SQL timeout, or cancellation during an outstanding SQL query. The startup GGUF checksum uses one supplied blocking file task; cancellation cannot terminate that file task once running. Timeout/cancellation is not rollback or proof a service stopped executing. Do not assign deliberate service-breakage exercises.
+
+## 12.3 — Inspect citations and support
+
+A **stable passage ID** identifies the saved draft passage under its preparation identity. The tutor uses the exact returned marker **`[source:<chunk_id>]`**, substituting only an actually returned chunk ID. The angle-bracket form here is explanatory, not a real citation to paste into an answer. Changing/finalizing a collection can change identities; stable does not mean eternal across corpus revisions.
+
+The tutor must cite only passages returned for the current learner turn, beside the claims they support. If evidence from an older turn is needed again, the learner asks again and a fresh per-turn retrieval runs; do not invent or recycle a citation outside the current returned set. Titles/authors/publication information are used only when verified and available. **Physical PDF pages** count from the first PDF page, including front matter; they are not the book's printed page labels. No inferred chapter, EPUB page, fabricated edition, or chart interpretation is allowed.
+
+An **excerpt clipping label** tells us that only a prefix of a stored passage was returned. The supplied token-bound prefix can end within a sentence; do not present a clipped prefix as the complete explanation or invent the missing continuation. The full stored content hash and raw fragment mapping identify the original passage, not a new uncropped quotation.
+
+The instructor privately opens `session-output.md` after the run and checks:
+
+- Which search query actually ran and which collection/profile it used.
+- The returned IDs, exact excerpts, source identities, physical pages and clipping labels.
+- Whether each cited ID belongs to returned evidence and whether that evidence supports the adjacent claim.
+- Whether the tutor separated source claims from course-authored background and acknowledged dated or incomplete support.
+
+**Membership is not semantic support.** A valid ID can be attached to an unsupported claim. A high similarity score is not a certified relevance threshold. No universal threshold is used to declare evidence sufficient or absent.
+
+Current collection reality:
+
+| PDF | Physical pages | Draft passages |
+| --- | ---: | ---: |
+| DayTrading.com beginners guide | 18 | 56 |
+| Markus Heitkoetter, The Complete Guide to Day Trading | 273 | 273 |
+| Corporate Finance Institute, The Complete Guide to Trading | 116 | 182 |
+| **Total** | **407** | **511** |
+
+Full layout/reading-order acceptance, remaining cleanup and alternative chunk-policy comparisons remain open. Retrieval can recover an oversimplified claim: the beginners guide's stop-loss wording is a known example. Do not endorse guaranteed realized-loss ceilings merely because a passage says so. Ask what the returned source actually says, what qualification is missing, and which caution comes from the fixed course material.
+
+## 12.4 — Give feedback without declaring mastery
+
+Try a source-grounded learning question: “Compare my statement with the supplied sources: a stop means I cannot lose more than the planned loss. Which qualification am I missing?”
+
+Predict a focused comparison, not a readiness score. Inspect the actual excerpts before deciding the answer is grounded. Good feedback identifies the learner's specific claim, describes supported or missing qualifications, and invites a short explanation in the learner's own words. The calculator remains optional for complete hypothetical numeric inputs: entry `51.20`, stop `50.70`, `200` shares means maximum **planned** loss `$100.00`, excluding fees, slippage and gaps. That value is not statistical expected loss or a guaranteed realized-loss ceiling.
+
+If excerpts do not support a requested detail, the tutor should say the returned evidence is insufficient and ask a narrower question. If the embedding/database service is unavailable, it should say search was unavailable—not claim the books contain no answer. This distinction is a teaching topic, not a prescribed failure exercise. Show a source disagreement only if actual evidence permits it; do not manufacture one for class.
+
+## 12.5 — Preserve consent and distrust source instructions
+
+**Untrusted retrieved text** is evidence that may include instruction-like content; it cannot override application instructions or expand capabilities. Approved learning notes are also data, not instructions. Framing tells the tutor how to treat them but is not proof of prompt-injection immunity.
+
+Memory consent remains default-no **per selection**. It gates reading the fixed-path record and advertising proposals, independently of source retrieval. Search neither enables memory nor grants approval. A quotation from a book, a tool response, or the tutor is not an actual learner quotation. The strict proposal check still requires actual learner words; source occurrence is not semantic agreement or mastery.
+
+A proposal only acknowledges preparation, without writing. After a successful ordinary final answer and inspection, each addition requires separate default-no local approval. Approved appends preserve hand edits; corrections/deletions happen between launches. The 32 KiB, regular UTF-8/no-symlink, new-file 0600, existing-permissions-unchanged and single-process durability limits from Lesson 11 remain. No crash-recovery or exactly-once promise is added by retrieval.
+
+Selection starts a fresh Session; replies retain that Session. `/finish` returns to selection; `/quit` and EOF exit; blank replies are ignored. Three content files are loaded at selection and fixed for that Session. Old diagnostics are never restored as memory. No compaction, new CLI, browsing, arbitrary SQL/file/network capability, market data or trade execution is introduced.
+
+## 12.6 — Approved tweak and second run
+
+Choose **one** small tweak:
+
+- Ask the same source-grounded question differently, for example “How do the supplied books connect ease of trading with the gap between buying and selling quotes?” Predict whether evidence remains relevant; compare actual support, not identical rankings or wording.
+- Edit the pacing sentence in `content/getting-started-guidance.md` to “Use a short hypothetical example before a check-for-understanding question.” Start a **fresh selection** to load the edit, ask a supported question, and inspect pacing and citations separately. Restore the default after rehearsal if desired.
+
+Do not change model profiles, collection identities, SQL, service timeouts or safeguards as a classroom tweak. Do not introduce infrastructure-failure exercises. Record inconclusive behavior honestly; fluent output is not automatic success.
+
+## Privacy, diagnostics and source rights
+
+Queries can contain learner text, and excerpts return to the local tutor. Use approved local endpoints only, no external inference fallback. Loopback client URLs do not fix a server listening on all interfaces: the instructor must inspect exposure and protect any explicitly approved LAN topology. The existing embedding process was reported bound to `0.0.0.0`; setup guidance uses loopback and does not automatically restart it.
+
+Private PDFs, extracted text, embeddings, exports and learner conversations are not public course assets. Ownership is not redistribution permission. Confirm processing/disclosure and authorized learner access before class. Git ignore is not encryption or access security. Do not project private diagnostics without permission; prepare sanitized examples instead.
+
+`session-output.md` remains plain Markdown, overwritten at launch and appended during selections/turns. It contains loaded context, complete before/after/post-approval Session Debug values including nested/default fields and usage, correlated requests/results, retrieval provenance/profile, assembled answers, decisions, warnings and available partial failures. It contains no application ANSI, deliberate credential/configuration dump, secret-bearing database URL or embedding-vector dump. It is never read as learner memory. Diagnostic/storage failures stop the application; unavailable logging cannot guarantee recording its own failure.
+
+The learner UI keeps Lesson 11's Tutor/Learner simplicity, presentation-only course colors and independent stdout/stderr gating, with plain fallback for redirected output, any `NO_COLOR`, and `TERM=dumb`. Common generated Markdown suppression is not a full renderer; verify exact citation markers survive it. Saved/provider text remains unchanged.
+
+## Success criteria and validation record
+
+**Structural success:** the actual prepared reader datastore and matching local embeddings are exercised; strict query shape and application-owned scope hold; results are bounded with traceable provenance; all tools share limits/correlation safeguards; citations belong to returned passages; learner UI stays simple; complete diagnostics remain plain/separate; memory consent and post-run local approval remain unchanged.
+
+**Human/live review:** the chosen evidence supports the adjacent claim; limited/no support is honestly explained; outages are distinguished from absence; source qualifications are preserved; feedback describes a particular learner answer without certifying mastery; actual tool selection, privacy and readability are reported rather than forced.
+
+Preparation already has recorded real 511-vector loading, idempotence, reader queries and profile-isolation evidence in RETRIEVAL.md. The older `harrier-test-511-v1` Transformers collection is preserved and **incompatible** with the active llama.cpp profile; do not mix them. Preparation smoke checks do not validate this new tutor integration, cross-runtime parity, expert source accuracy, or a final corpus freeze. The implementation outcomes below distinguish structural checks from fallible teaching behavior. End-of-course content/teaching/UI review remains deferred, not completed; previous lessons' validation gaps remain independent.
+
+### Implementation validation — 2026-10-12
+
+- Root formatting, locked Cargo check, Clippy across all targets, IDE build and **40 deterministic tests** passed; **two opt-in local integration tests** also passed explicitly. They exercise actual query embeddings/SQL, source integrity, tutor-token counting including canonical JSON/provenance, excerpt clipping bounds, budget-limited omission, and two searches in one SDK batch sharing a single 4,000-token ledger. Public fixtures are course-authored inline test data, not book excerpts. Preparation regression tests also passed (32 automatic tests; its two separately opted-in corpus tests were not rerun in this integration pass).
+- The real local liquidity/spread question selected search, returned three candidate excerpts using **2,555 tutor tokens**, and cited the two relevant CFI passages at physical pages 41 and 23. The adjacent explanation was inspected against those exact returned excerpts. The third candidate was irrelevant; top-k is not a relevance guarantee. The optional calculator then returned a correlated **$100.00** with exclusions. No record was read or proposed with declined consent.
+- A rephrased source question searched and cited returned IDs, but blurred the forex passage into stock/share language. A source-grounded misconception-feedback run corrected the low-liquidity/wide-spread relationship without a mastery claim, yet its opening sentence incorrectly called the relationship “direct” and reversed the learner's stated relationship; its subsequent explanation was not fully supported by the cited excerpts. **These are teaching/support defects, not deterministic citation failures.** Citation membership cannot certify explanation quality.
+- A dated AAPL price question declined unsupported market-data claims and gave no fabricated price, but did **not** search despite the requested search. Its blanket claim about what the books contain was not established by retrieval. Honest refusal was observed; source-absence validation was not.
+- Live consented proposal preparation did not write before local approval; approved append succeeded; an independently declined second addition preserved bytes. A hand edit was loaded into a fresh launch's prompt context, but the welcome did **not** explicitly offer the edited activity. Memory transport/storage passed; memory-aware resumption teaching remains incomplete. The disposable test record was removed. `/finish` reselection, `/quit`, plain/empty-NO_COLOR/TERM=dumb dialogue and diagnostics were exercised; deterministic EOF/blank-input tests passed.
+- Colored arrow/Enter selection and source-marker display passed on retry. The first colored run returned evidence but no ordinary final tutor answer; the application stopped, recorded complete available partial state, and offered no approval. Do not hide that reliability failure. Redirected/plain logs and all checked Markdown diagnostics contained no application ANSI; citations survived the streaming presentation helper.
+- Startup rejected the reader's inherited PUBLIC temporary-table privilege. The instructor-side startup script now revokes TEMPORARY on this dedicated database; the same restriction was applied to the existing database without changing its corpus. The stricter reader check then passed. Added response model/profile provenance made a former 150-token empty-result test allowance too small; the corrected test verifies budget-limited output at 400 and an explicit error at 150. No silent over-budget output was permitted.
+
+The inspected embedding runtime has eight slots and **2,048 tokens per slot**; the documented 8,192/8 startup example has 1,024 per slot. Runtime preflight uses the actual reported capacity, never training context. Existing services were not restarted; the user's Harrier process still listens on all interfaces. Clients use loopback and do not fall back externally, but operators must restrict server exposure. No offline-with-network-disabled test, full injected-outage/malformed-service matrix, exhaustive citation support benchmark, cross-runtime parity, index recall/latency benchmark, or corpus freeze is claimed. Rights and authorized learner access remain the operator's responsibility. Content/teaching/UI and instructor release review remain deferred to end-of-course review; prior lesson gaps are independent. No Lesson 13/14 code was introduced.
+
+Private raw evidence remains in ignored `day_trading/embeddings/postgres-local/lesson12-*` captures, not public lesson examples. Diagnostics can contain private excerpts and learner text; Git ignore is not access control.
+
+### Modularization validation — 2026-10-22
+
+- Behavior-preserving local extraction passed `cargo fmt --check`, `cargo check`, `cargo clippy --all-targets`, `cargo test` and `cargo build`: **40 deterministic tests passed; two live tests were ignored by default**. The source audit preserved all **158 original function/test bodies**, test names and constants. Literals, types and attributes were preserved apart from necessary visibility/import changes and test `cfg` placement. No prompt, content, dependency, budget, authority or semantic fix was made.
+- Both ignored real-service tests were explicitly attempted and failed because **`RETRIEVAL_DATABASE_URL` was missing**. `cargo run -- custom_aa_llama_qwen3_6-35b.json` failed at the same prerequisite **before the chooser**. The private `connection.env` was absent; Harrier on port 9999 was unavailable; the tutor on port 8080 returned health HTTP 200. Tutor health alone is not retrieval readiness. No mocks were substituted, services restarted or corpus mutated.
+- Plain, empty-`NO_COLOR` and `TERM=dumb` launch-error output and independent stderr terminal gating were checked. This is error-path presentation evidence, **not** a fresh conversation, chooser, consent/storage, search, calculator or teaching validation. The historical successful integration and semantic defects above remain historical evidence, not fresh modularized live success. No fresh IDE/projector or release review is claimed.
+- Root activation uses the entire recursive source tree, not a main/retrieval pair; the combined refactor's final root is Lesson 14. Lesson 9's default and 100-share live runs passed on 2026-10-22, resolving that earlier validation gap independently. Other historical teaching defects and deferred instructor review remain; this pass grants no release approval.
+
+## Exit questions and next step
+
+- Why must a query embedding match the passage embedding space, not just its dimension?
+- What differs between HNSW, cosine distance, citation membership and semantic support?
+- Why can a retrieved passage be relevant but still oversimplified or outdated?
+- Which information can authorize a memory addition? Can a source passage supply learner agreement?
+- What does the per-turn evidence cap limit, and what long-history problem does it not solve?
+
+Next, Lesson 13 will manage growing working context while preserving provenance, request/result pairing and local approvals. That is future behavior, not automatic GDK compaction or part of this lesson.
+
+Supplemental official orientation: [GDK SDK overview](https://goose-docs.ai/docs/gdk/sdk), [SDK API reference](https://goose-docs.ai/docs/gdk/sdk/api-reference). These pages orient the provider layer; exact state-machine/tool behavior here was checked against the pinned `goose-agent` source, not inferred from full Goose application features.
+
+
+### Service-default validation — 2026-10-28
+
+Added the instructor-supplied reader connection and Harrier/tutor origins as constants at the top of main. Retrieval uses them only when the corresponding environment variable is absent; the main tokenizer-origin comparison uses the same tutor default. Invalid/non-Unicode retrieval environment values still fail instead of silently selecting a default. No process environment is rewritten, and no credential is deliberately added to diagnostics or telemetry. Provider JSON, compatibility checks, reader checks, dependencies and services are unchanged. The plaintext default is a classroom-only exception, not secure credential management.
+
+Locked format/check/all-target Clippy/all-target tests/build passed in temporary staging for each complete reference: Lesson 12 **41**, Lesson 13 **67**, Lesson 14 **69** deterministic application tests, plus seven unchanged seeder tests each. One new test per lesson validates the reader host/role/database/port, local service origins and absent-variable fallback. The active Lesson 12 root independently passed the same checks and byte-matches its reference. Existing staged changes were preserved; no lesson activation replaced the user's root.
+
+With all three override variables unset, both opt-in actual-service tests and the documented launch were attempted for each reference. All stopped with **`embedding runtime identity mismatch`** before the chooser: the existing Harrier service does not satisfy the pinned runtime identity check. This is blocked live validation, not a passed database connection, retrieval, tutor exchange, approval, compaction or telemetry run. No service restart, compatibility relaxation, corpus/catalog write or mock substitution occurred. No fresh IDE/projector/UI or teaching-quality validation is claimed; historical findings and review gates remain.
+
+
+## Embedding server build flexibility — 2026-10-28
+
+At the instructor's request, the learner application no longer requires an exact llama.cpp build string. A different or absent `/props` `build_info` is accepted. Model alias, F16 format, GGUF checksum, dimensions, context capacity, pooling, normalized vectors, query formatting, stored collection/profile identity, provenance and reader restrictions remain checked. The stored profile's build suffix records the original embedding preparation; it is not a requirement that the current query server report that build. Accepting another build does not establish numerical equivalence or retrieval-quality parity. The standalone preparation loader/client retains its separate pinned-build policy. No service restart, re-embedding or collection mutation is needed solely to pass the removed build check.
+
+Validation for this change: formatting, locked check, all-target Clippy, all-target tests and build passed (41 deterministic application tests plus seven unchanged seeder tests). Both opt-in actual-service retrieval tests passed against the currently running services, including server build `b11669-620d2225c`; the documented launch reached the chooser and exited on EOF. Lesson 12 was checked in the active root; Lessons 13–14 were checked in temporary staging without replacing root. Regression coverage accepts changed/absent build metadata and still rejects incorrect model alias/format, sleeping/no-slot runtime and mismatched context. No full tutor conversation, approval/compaction/telemetry workflow, numerical cross-build parity benchmark, fresh UI/IDE/projector or teaching-quality review was performed. No services restarted, corpus/catalog modified, preparation client changed or dependencies updated. Existing historical defects/review gates remain.
+## Learner-led topic scope — 2026-10-28
+
+The four supplied teaching units are optional background examples, not a topic whitelist or required progression. Learners may ask open-ended day-trading questions outside those examples and choose the depth of discussion. Offer topic suggestions only when asked or when the learner wants help choosing a direction. General educational discussion of broker-comparison criteria is allowed; personalized trading recommendations and unsupported claims about current fees, regulations or broker terms are not. Limited source coverage is an evidence limitation, not a ban on the topic.
+
+The three editable content files retain this lesson's own capability and authority instructions; do not replace later-lesson contracts with Lesson 10's calculator-only contract. Content changes take effect on a fresh selection, not in an already-running selected conversation. Historical teaching findings remain evidence about earlier content, not proof that this revision fixes model behavior.
+
+Validation for this content-only revision: static scope/capability/original-section checks passed across Lessons 10–14. The active Lesson 12 context-loading test and all-target tests passed (41 application tests and seven unchanged dataset-seeder tests; two opt-in real-service tests were not run). No new live teaching, approval, retrieval, compaction or telemetry validation is claimed.
+
+## Forced per-turn source grounding and reference restoration — 2026-11-11
+
+The instructor had the root restored to this lesson's complete reference and had all lesson documentation brought in line with the actual restored design. A Lesson 13 shared-library split had briefly existed in the working copy; its orphaned files were removed and the root again byte-matches `lessons/12-specialized-retrieval/src/`, which now holds the cleaned tree. `examples/rag_calibration.rs` was reverted to the pre-split single-crate API (`Retrieval::from_env`, `#[path = "../src/retrieval.rs"]`). That revert remains an uncommitted working-tree change; no commit was made.
+
+Design correction for this documentation pass: the reference implements **forced per-turn source grounding**, not a model-callable retrieval tool. There is no `search_educational_passages` tool, no `RetrievalToolProvider`, and no `EvidenceBudget` in the source. Grounding constants: similarity threshold 0.55 (`GROUNDING_MIN_SIMILARITY` override, validated 0.0..=1.0), at most three statements (`GROUNDING_MAX_STATEMENTS`), and 2,500 actual tokens per turn (`GROUNDING_TOKEN_BUDGET`, caller-owned). After a genuine learner reply is appended to history, `prepare_turn_grounding` runs one retrieval — the learner input is the query, and input over 2,000 UTF-8 bytes degrades the turn to `unavailable` — before the machine runs; the application-authored kickoff does not ground. `select_grounding` filters SQL's top five candidates to those at or above the threshold and takes at most three; empty selection reports `no_evidence`; retrieval failure reports `unavailable` with the full failure in diagnostics and a learner-visible warning. The excerpts travel as a per-turn `source-grounding` prompt part with `[source:<id>]` rules and are never saved into conversation history; `citation_footer` lists provenance for IDs the tutor actually cited. The tool surface remains the calculator plus the conditional proposal definition behind SafeTools/RunLimit. The lesson body above was corrected from the earlier tool-based description; dated records elsewhere in this file were left verbatim.
+
+Validation for the restoration and this documentation pass: `cargo fmt --check`, `cargo check`, `cargo clippy --all-targets`, `cargo test` and `cargo build` passed. Deterministic tests now total **46** (up from the historical 40/41 counts recorded through the modularization and service-default passes), with the two `#[ignore]` live tests (`live_forced_grounding_prepares_turn_state_without_touching_history` and the retrieval smoke test) both passing explicitly in 18.93s against tutor :8080, Harrier :9999 and PostgreSQL :55432. The documented launch `printf "q\n" | cargo run -- custom_aa_llama_qwen3_6-35b.json` reached the chooser and exited 0, printing the grounding banner. No corpus mutation, dependency change, or service restart occurred. No fresh teaching-quality, UI or IDE/projector review is claimed; historical semantic defects and deferred instructor review remain.
+
+## Grounding acknowledgment enforcement and per-request prompt diagnostics — 2026-11-11
+
+Instructor follow-up after a live turn showed the tutor receiving a qualifying excerpt (similarity 0.684, above the 0.55 threshold) and silently answering with no `[source:]` markers. Root cause was tutor behavior, not retrieval or state handling; the fix keeps relevance judgment with the application, never the model. Three coordinated changes, all behavior-visible and all covered by deterministic tests:
+
+1. **Mandatory-acknowledgment prompt contract (b):** the `source-grounding` prompt part now states that acknowledgment of supplied excerpts is mandatory — cite each excerpt used with its exact `[source:<id>]` marker, or decline in one sentence ending with the exact `[source:none]` marker — and that a reply doing neither is non-compliant and will be asked again. The part is inserted **first** in the system prompt (before tutor contract/educational material/teaching guidance) so the enforcement contract is not buried. The model-facing [tutor contract](content/tutor-contract.md) was updated to the same rules.
+2. **Application-side escalation (c):** `GroundingOutcome` classifies each grounded reply application-side as `NotSupplied`, `Cited`, `Declined` (the `[source:none]` sentinel, sanctioned only on grounded turns), or `SilentIgnore`, using `extract_citations`; citing wins over a simultaneous decline (a flagged contradiction, per `inspect_citations`, which now warns on the sentinel instead of treating silent-ignore as a citation-list finding). A `SilentIgnore` outcome appends one authored `GROUNDING_ESCALATION_MESSAGE` as a user message and re-runs the turn exactly once — never two escalations — under fresh per-attempt bounds (`append_user` resets applied passes/halt reason). Because proposal provenance windows on the latest user message, first-attempt proposals are approved **before** the append, and the escalation message is excluded from learner-quote provenance. A `Declined` outcome is reported to the learner as a plain source note.
+3. **Per-request system prompt diagnostics (d):** a `PromptDiagnosticsPreparer` wraps the SDK's `IdentityInferenceRequestPreparer` behind `InferenceRunner::with_request_preparer`, capturing every genuine inference request's exact `system_prompt` and draining the captures into diagnostics after each attempt as `Application → provider: exact system prompt (initial run | escalated re-run, request N)` blocks — including on failure paths.
+
+Also fixed: `TurnGrounding`'s manual `Default` now uses status `"none"` (was an empty string) to match the kickoff/no-grounding state.
+
+Validation for this pass: `cargo fmt --check`, `cargo check --all-targets`, `cargo clippy --all-targets` (zero warnings), `cargo test` (49 deterministic tests, up from 46; three new: outcome classification, escalation message excluded from learner-quote provenance, exact system-prompt capture by the preparer) and `cargo build` passed. Both `#[ignore]` live tests passed explicitly in 18.46s against tutor :8080, Harrier :9999 and PostgreSQL :55432. The documented launch `printf "q\n" | cargo run -- custom_aa_llama_qwen3_6-35b.json` reached the chooser and exited 0. A live two-launch run of the previously silent-ignored journal/psychology question showed the tutor citing both supplied excerpts with exact markers beside the claims (outcome recorded as `cited`), with diagnostics containing the kickoff prompt dump (no grounding part), the grounded-turn dump **leading** with the source-grounding contract, the outcome classification blocks, and complete `turn_grounding` state. `src/` was mirrored byte-identical into this lesson's `src/`. The escalation re-run path itself is covered deterministically, not yet forced live; forcing a live silent-ignore is non-deterministic and was not attempted. No escalation, decline, or contradiction case has live-provider evidence yet. Historical semantic defects, teaching/UI review and the deferred end-of-course review remain.
+
+## Pre-display citation gate backport — 2026-11-12
+
+The Lesson 13 pre-display citation gate was backported into this lesson's reference `src/`, keeping this lesson's single-crate layout:
+
+- **New `src/citations.rs` module.** Holds `CitationOrigin`, `CitationRegistry`, registry-aware `inspect_citations`, `GroundingOutcome` (including the new `InvalidAcknowledgment` variant), `invalid_citation_markers`, and `citation_footer`, adapted from the RAG library to `use crate::{retrieval, TurnGrounding};`. The formerly inline helpers were deleted from `main.rs`.
+- **`CitationRegistry`.** Created once before the kickoff and recorded after every `prepare_turn_grounding` call (which now returns `TurnGrounding`). It resolves every `[source:<id>]` the application ever supplied in this conversation — deliberately stricter than a raw database lookup (an ID in the database but never supplied is still fabricated from the model's perspective) and no database hop per reply.
+- **Buffered display + gate.** `display_events` buffers the whole reply; `run_attempt` gains a `citation_registry` parameter and returns `(ChatSession, Vec<String>, bool, Vec<u8>)`. Any never-supplied marker withholds the entire reply with one warning per marker; a clean reply is flushed with its citation footer (earlier-turn IDs resolve through the registry with "(from an earlier turn's excerpts)").
+- **One bounded re-ask, this lesson's idiom.** The `InvalidAcknowledgment` arm is inline in `run_turn`: it runs `approve_record_proposals` **before** appending the escalation (the escalation user message moves the `messages_since_kickoff` provenance window forward), builds the valid-marker list (current-turn evidence first, then registry IDs not already present, suffixed "supplied with an earlier turn"), appends one application-authored reminder via `runtime.append_user`, and re-runs the attempt once. A still-fabricated second reply is shown unverified with a warning. The reminder text is identical to Lesson 13's.
+
+Validation: the tree was activated in the repository root (staging crates fail because `REPOSITORY_ROOT` is a compile-time path): `cargo test --bin gdk-hello` 51 passed + 2 ignored, `cargo build` OK, and formatting fixes (import/module ordering and line wrapping only) were copied back so `rustfmt --check` is clean in this lesson's own location. `cargo clippy --bin gdk-hello` and `cargo clippy --tests` both report zero warnings. (`cargo clippy --all-targets` cannot be used while this lesson is active: the `rag_calibration` example requires the Lesson 13 RAG library — an earlier unidentified two-line clippy count was exactly that example's compile error.) Root was restored to Lesson 13 afterward and re-verified. Not validated: the live fabrication → withhold → re-ask path (non-deterministic; deterministic coverage only), and the two `#[ignore]` real-service tests were not rerun for this pass.

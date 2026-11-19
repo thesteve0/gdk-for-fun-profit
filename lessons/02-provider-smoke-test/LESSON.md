@@ -1,0 +1,146 @@
+# Lesson 2: Provider Smoke Test
+
+## Goal
+
+Verify that a configured provider can be constructed and use the public Goose Rust provider API to discover the models it makes available. This is deliberately a smoke test: it does not create messages, make an inference request, or process a stream.
+
+## Concepts introduced
+
+- A **provider** is the application's configured connection to a model service.
+- A **model** is the model service's text-generating component; a provider can make more than one model available.
+- A declarative provider JSON is the source of truth for provider setup.
+- The public `goose_providers` Rust crate constructs a provider from that JSON.
+- `fetch_supported_models()` asks that provider for its supported models.
+- Tokio runs the asynchronous model-discovery call.
+
+## Where this fits in the application
+
+Lesson 1's application overview showed that the application sends later inference requests through a provider to a model. This lesson establishes that connection without asking a model to generate anything:
+
+```text
+Rust application
+    |
+    | reads provider JSON and constructs a provider
+    v
+Provider
+    |
+    | discovers available model identifiers
+    v
+Model service
+```
+
+The provider owns provider-specific details such as the configured endpoint, authentication, headers, and model-discovery behavior. The application owns the provider JSON and decides when to ask for discovery. This is not an **inference** request yet: inference is the later request/response exchange in which the application asks a selected model to generate a response.
+
+## What this test checks
+
+1. The provider JSON can be parsed and used to construct a Goose provider.
+2. The provider's configured authentication, headers, base URL, and model-discovery behavior are used together.
+3. At least one model is available.
+4. Whether the first configured model in the JSON appears among the advertised model IDs.
+
+For the configured OpenAI-compatible provider, `fetch_supported_models()` queries its models endpoint. Its exact behavior comes from the provider configuration: `dynamic_models: false` uses the configured static list; `true` or `null` attempts discovery and can fall back to configured models if the endpoint is unavailable with a 404. A successful discovery call proves neither inference nor streaming; Lesson 3 covers those separately.
+
+## Prerequisites
+
+- Lesson 1 is complete.
+- This lesson adds two requirements to the root `Cargo.toml` that Lesson 1 does not use yet: `serde_json = "1.0.149"` for reading the provider JSON, and `tokio = { version = "1", features = ["macros", "rt-multi-thread"] }` to drive the asynchronous entry point.
+- The exact `goose-providers` dependency from the root manifest is available.
+- A compatible provider is running at the selected JSON configuration's `base_url` when its configuration uses dynamic model discovery.
+
+## Terminal presentation (supplied support)
+
+Supplied **terminal presentation helpers** color application headings bold cyan, successful connection/model checks green, and the existing model-mismatch warning yellow. Errors are bold red on stderr. Model IDs and other metadata remain normal; nothing is dimmed. Each output stream independently uses plain text when redirected, when `NO_COLOR` is present (even empty), or when `TERM=dumb`. Existing text, spacing, and stdout/stderr destinations are unchanged. These helpers are provided in the complete standalone reference; learners do not need to implement them.
+
+The supplied `main` wrapper displays a returned error once and exits with status 1; the lesson's fallible work remains in `run_application`. This keeps errors under application presentation control rather than Rust's default runtime formatting.
+
+## Step 2.1: Load environment and configuration
+
+Start with the imports and default path:
+
+```rust
+use goose_providers::declarative::{from_json, EnvKeyResolver};
+
+const DEFAULT_PROVIDER_CONFIG: &str = "custom_aa_llama_qwen3_6-35b.json";
+```
+
+Load `.env` before constructing the provider, then read the selected JSON file:
+
+```rust
+dotenvy::dotenv().ok();
+let provider_json = fs::read_to_string(provider_config_path)?;
+let provider = from_json(&provider_json, None, EnvKeyResolver {})?;
+```
+
+`from_json` is the public constructor in the Goose Rust provider library. It resolves the declarative configuration—including its environment-variable settings—before returning a provider object. The returned provider is the application-side interface to the model service; it is not the model itself and it does not perform inference here. Keep the provider JSON as the authority; do not reconstruct its URL, authentication, headers, or endpoint paths in application code.
+
+## Step 2.2: Discover models through the provider
+
+Model discovery is asynchronous because it may make a network request. Tokio drives the asynchronous entry point; its supplied wrapper presents errors. Call the provider method from the fallible application function:
+
+```rust
+#[tokio::main]
+async fn main() {
+    if let Err(error) = run_application().await {
+        print_error(&format!("Error: {:?}", error));
+        std::process::exit(1);
+    }
+}
+
+async fn run_application() -> Result<(), Box<dyn Error>> {
+    // ... load environment and construct `provider`
+    let available_models = provider.fetch_supported_models().await?;
+
+    if available_models.is_empty() {
+        return Err("Provider is reachable but returned no models".into());
+    }
+    print_status(&format!("Connected to provider: {}", provider.get_name()));
+    print_heading("Available models:");
+    for model_name in &available_models {
+        println!("- {}", model_name);
+    }
+    // ... compare the first configured model with the advertised IDs
+    Ok(())
+}
+```
+
+This keeps provider-specific details inside the Goose library. In particular, the configured provider's normal authentication and headers are applied if model discovery makes an HTTP request. The complete reference source is [`src/main.rs`](src/main.rs). That source also defines a `first_configured_model` helper, which reads the first name from the JSON's `models` array and compares it with the advertised IDs after discovery.
+
+## Step 2.3: Run it
+
+From the repository root, temporarily copy this lesson's reference source into `src/main.rs` as directed by the instructor, then run:
+
+```bash
+cargo run
+```
+
+To select another provider JSON:
+
+```bash
+cargo run -- path/to/provider.json
+```
+
+Example output:
+
+```text
+Connected to provider: custom_aa_llama_qwen3_6-35b
+Available models:
+- qwen3.6-35b-a3b
+```
+
+Provider names and model IDs depend on the selected configuration and endpoint.
+
+## Expected structural behavior
+
+The program loads `.env`, reads one provider JSON path, constructs a provider through `from_json`, awaits `fetch_supported_models`, rejects an empty result, and prints the provider and each returned model ID. When the JSON declares a configured model, it also compares that name against the advertised IDs and prints the outcome; the comparison is skipped when the JSON declares no model. It must not make an inference request.
+
+## Success criteria
+
+- The selected provider configuration constructs successfully.
+- Model discovery completes, either through the configured endpoint or the configuration's documented static fallback behavior.
+- At least one model is returned and printed.
+- If the JSON declares a configured model, the run prints whether that model is among the advertised IDs. A mismatch message is an expected diagnostic, not a run failure: it names the configured model and lists the advertised IDs so the two can be aligned before the next lesson.
+- No manually assembled HTTP request, authentication header, or endpoint path appears in application code.
+
+## Next
+
+Lesson 3 introduces typed messages, request-specific model configuration, async streaming, and chunk handling.

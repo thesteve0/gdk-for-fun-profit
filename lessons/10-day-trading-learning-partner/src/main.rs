@@ -1,0 +1,837 @@
+// Lesson 10
+// Local modules hold previously taught calculator code and supplied UI/logging support.
+mod calculator;
+mod chooser;
+mod diagnostics;
+mod presentation;
+mod provider_setup;
+#[cfg(test)]
+mod tests;
+
+use calculator::{execute_allowed_tool, tool_definition, TOOL_NAME};
+use chooser::{choose_lesson, read_line};
+use diagnostics::DiagnosticLog;
+use presentation::{
+    print_delimiter, print_error, print_heading, print_status, print_warning, stdout_color_enabled,
+    styled, TextStyle,
+};
+use provider_setup::{first_configured_model, provider_config_path};
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    io::{self, Write},
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
+
+use async_trait::async_trait;
+use goose_agent::{
+    events::AgentEvent,
+    inference::{InferenceEffect, InferenceRunner},
+    machine::{EffectHandler, MachineSession, SessionLoader, StateMachine, Step},
+    operation::{
+        applied, messages_since_kickoff, not_applicable, yielded_with, Emitter, MachineEffect,
+        Operation, OperationResult,
+    },
+    tool::{ToolOperation, ToolProvider},
+};
+use goose_providers::{
+    base::Provider,
+    conversation::{
+        message::{Message, ToolRequest},
+        token_usage::ProviderUsage,
+        Conversation,
+    },
+    declarative::{from_json, EnvKeyResolver},
+    model::ModelConfig,
+};
+use rmcp::model::{CallToolRequestParams, CallToolResult, ErrorData, Tool};
+use serde_json::{json, Value};
+use tokio::sync::{mpsc, Mutex};
+use tokio_util::sync::CancellationToken;
+
+#[cfg(test)]
+const SESSION_ID: &str = "test-session";
+const LESSON_TITLE: &str = "Getting started in day trading";
+const OPENING_INPUT: &str =
+    "Begin the selected learning conversation by asking about my experience and learning goals.";
+// Resolve course files against the shared manifest, not the process working directory.
+const REPOSITORY_ROOT: &str = env!("CARGO_MANIFEST_DIR");
+const CONTENT_DIRECTORY: &str = "lessons/10-day-trading-learning-partner/content";
+const MAX_APPLIED_PASSES: usize = 8;
+const MAX_TOOL_REQUESTS: usize = 4;
+const RUN_TIMEOUT_SECONDS: u64 = 180;
+
+#[tokio::main]
+async fn main() {
+    if let Err(error) = run_application().await {
+        print_error(&format!("Error: {:#}", error));
+        std::process::exit(1);
+    }
+}
+
+// Editable application-owned context is fixed for the lifetime of a selected lesson.
+#[derive(Clone, Debug)]
+struct LessonContext {
+    title: String,
+    contract: String,
+    material: String,
+    guidance: String,
+}
+
+impl LessonContext {
+    fn load() -> anyhow::Result<Self> {
+        let directory = PathBuf::from(REPOSITORY_ROOT).join(CONTENT_DIRECTORY);
+        let context = Self {
+            title: LESSON_TITLE.to_string(),
+            contract: fs::read_to_string(directory.join("tutor-contract.md"))?,
+            material: fs::read_to_string(directory.join("getting-started-material.md"))?,
+            guidance: fs::read_to_string(directory.join("getting-started-guidance.md"))?,
+        };
+        if context.contract.trim().is_empty()
+            || context.material.trim().is_empty()
+            || context.guidance.trim().is_empty()
+        {
+            return Err(anyhow::anyhow!("selected lesson content must not be empty"));
+        }
+        Ok(context)
+    }
+
+    fn prompt_parts(&self) -> Vec<(String, String)> {
+        vec![
+            ("tutor-contract".to_string(), self.contract.clone()),
+            ("educational-material".to_string(), self.material.clone()),
+            ("teaching-guidance".to_string(), self.guidance.clone()),
+        ]
+    }
+}
+
+async fn run_application() -> anyhow::Result<()> {
+    // Truncate once per launch, then append every lesson and turn to this file.
+    let mut diagnostics = DiagnosticLog::create()?;
+    let result = run_learning_partner(&mut diagnostics).await;
+    if let Err(error) = &result {
+        diagnostics.block("Launch failure", "text", &format!("{:#}", error))?;
+    }
+    result
+}
+
+async fn run_learning_partner(diagnostics: &mut DiagnosticLog) -> anyhow::Result<()> {
+    dotenvy::dotenv().ok();
+    let config_path = provider_config_path()?;
+    let provider_json = fs::read_to_string(config_path)?;
+    let provider_config: Value = serde_json::from_str(&provider_json)?;
+    let boxed_provider = from_json(&provider_json, None, EnvKeyResolver {})?;
+    let provider: Arc<dyn Provider> = Arc::from(boxed_provider);
+    let model_name = first_configured_model(&provider_config)?;
+    let model = ModelConfig::new(model_name);
+    print_heading("Day-trading learning partner");
+    println!("Education only; no live market data or trade execution.");
+    println!("Diagnostics: session-output.md (overwritten each launch; may contain personal conversation).");
+    let mut session_number = 0;
+    while choose_lesson()? {
+        session_number += 1;
+        let session_id = format!("lesson-10-{}", session_number);
+        let context = LessonContext::load()?;
+        diagnostics.lesson(&session_id, &context)?;
+        let runtime = ChatRuntime::new(&session_id, context);
+        let tools = SafeTools {
+            inner: ToolOperation::new().with_provider(Arc::new(LossToolProvider)),
+        };
+        let runner = InferenceRunner::new(provider.clone(), model.clone());
+        let steps: Vec<Step<'_, ChatSession, ChatEffect>> = vec![
+            Step::Operation(Arc::new(RunLimit)),
+            Step::Operation(Arc::new(tools)),
+            Step::Inference(Arc::new(runner)),
+        ];
+        let cancel = CancellationToken::new();
+        let machine = StateMachine::new(steps, cancel.clone());
+        print_heading(&format!("\n{}", LESSON_TITLE));
+        println!(
+            "Ask questions and explore at your pace. /finish returns to lessons; /quit exits."
+        );
+        let mut turn_number = 1;
+        // Selection initiates the welcome; this is application input, not a learner reply.
+        run_turn(
+            &machine,
+            &runtime,
+            &cancel,
+            &session_id,
+            turn_number,
+            diagnostics,
+        )
+        .await?;
+        loop {
+            let input = match read_line("Learner > ")? {
+                Some(input) => input,
+                None => {
+                    diagnostics.block(
+                        "Session ended",
+                        "text",
+                        "End of input; application exited.",
+                    )?;
+                    return Ok(());
+                }
+            };
+            match reply_action(&input) {
+                ReplyAction::Finish => {
+                    diagnostics.block(
+                        "Session ended",
+                        "text",
+                        "/finish: returned to the chooser.",
+                    )?;
+                    print_status("Conversation finished. Starting again creates a fresh Session.");
+                    break;
+                }
+                ReplyAction::Quit => {
+                    diagnostics.block("Session ended", "text", "/quit: application exited.")?;
+                    return Ok(());
+                }
+                ReplyAction::Empty => continue,
+                ReplyAction::Message => {}
+            }
+            runtime.append_user(&session_id, &input).await?;
+            turn_number += 1;
+            run_turn(
+                &machine,
+                &runtime,
+                &cancel,
+                &session_id,
+                turn_number,
+                diagnostics,
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn run_turn(
+    machine: &StateMachine<'_, ChatSession, ChatEffect>,
+    runtime: &ChatRuntime,
+    cancel: &CancellationToken,
+    session_id: &str,
+    turn_number: usize,
+    diagnostics: &mut DiagnosticLog,
+) -> anyhow::Result<()> {
+    let before = runtime.load(session_id).await?;
+    diagnostics.turn(turn_number, &before)?;
+    let (event_tx, event_rx) = mpsc::channel::<AgentEvent>(32);
+    let emit = Emitter::new(event_tx, cancel.clone());
+    // The GDK owns all passes within a turn; the application waits for input afterward.
+    let run = async {
+        let timed_result = tokio::time::timeout(
+            Duration::from_secs(RUN_TIMEOUT_SECONDS),
+            machine.run(runtime, session_id, &emit),
+        )
+        .await;
+        let run_result = match timed_result {
+            Ok(result) => result,
+            Err(_elapsed) => {
+                cancel.cancel();
+                Err(anyhow::anyhow!(
+                    "turn exceeded the {}-second execution bound",
+                    RUN_TIMEOUT_SECONDS
+                ))
+            }
+        };
+        // Close the sender even on failure and drain concurrently before inspecting state.
+        drop(emit);
+        run_result
+    };
+    let (run_result, display_result) = tokio::join!(run, display_events(event_rx));
+    let saved = runtime.load(session_id).await?;
+    diagnostics.after(&saved)?;
+    let summary = match display_result {
+        Ok(summary) => summary,
+        Err(error) => {
+            diagnostics.block(
+                "Display failure (partial Session above)",
+                "text",
+                &error.to_string(),
+            )?;
+            return Err(error.into());
+        }
+    };
+    for message in &summary.tool_events {
+        diagnostics.block(
+            "Tool presentation Event (saving is separate)",
+            "rust",
+            &format!("{:#?}", message),
+        )?;
+    }
+    let final_session = match run_result {
+        Ok(session) => session,
+        Err(error) => {
+            diagnostics.block(
+                "Run failure (partial Session above)",
+                "text",
+                &format!("{:#}", error),
+            )?;
+            return Err(error);
+        }
+    };
+    let validation = inspect_turn(&final_session, &summary);
+    let warnings = match validation {
+        Ok(warnings) => warnings,
+        Err(error) => {
+            diagnostics.block(
+                "Turn failure (partial Session above)",
+                "text",
+                &format!("{:#}", error),
+            )?;
+            return Err(error);
+        }
+    };
+    for warning in warnings {
+        print_warning(&warning);
+        diagnostics.block("Warning", "text", &warning)?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, PartialEq)]
+enum ReplyAction {
+    Finish,
+    Quit,
+    Empty,
+    Message,
+}
+
+fn reply_action(input: &str) -> ReplyAction {
+    match input.trim() {
+        "/finish" => ReplyAction::Finish,
+        "/quit" => ReplyAction::Quit,
+        "" => ReplyAction::Empty,
+        _ => ReplyAction::Message,
+    }
+}
+
+// A loaded Session is a snapshot, not a list of completed Operations.
+#[derive(Clone)]
+struct ChatSession {
+    id: String,
+    conversation: Conversation,
+    usage: Vec<ProviderUsage>,
+    applied_passes: usize,
+    halt_reason: Option<String>,
+    lesson: LessonContext,
+}
+
+impl MachineSession for ChatSession {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn conversation(&self) -> Option<&Conversation> {
+        Some(&self.conversation)
+    }
+}
+
+// The runtime supplies the engine's loading and saving boundaries.
+struct ChatRuntime {
+    sessions: Mutex<HashMap<String, ChatSession>>,
+}
+
+impl ChatRuntime {
+    fn new(session_id: &str, lesson: LessonContext) -> Self {
+        let mut conversation = Conversation::empty();
+        conversation.push(Message::user().with_text(OPENING_INPUT));
+        let session = ChatSession {
+            id: session_id.to_string(),
+            conversation,
+            usage: Vec::new(),
+            applied_passes: 0,
+            halt_reason: None,
+            lesson,
+        };
+        let mut sessions = HashMap::new();
+        sessions.insert(session_id.to_string(), session);
+        Self {
+            sessions: Mutex::new(sessions),
+        }
+    }
+
+    #[cfg(test)]
+    fn seeded() -> Self {
+        let lesson = LessonContext::load().expect("supplied lesson content");
+        Self::new(SESSION_ID, lesson)
+    }
+
+    async fn append_user(&self, session_id: &str, text: &str) -> anyhow::Result<()> {
+        let mut sessions = self.sessions.lock().await;
+        let stored = match sessions.get_mut(session_id) {
+            Some(stored) => stored,
+            None => return Err(anyhow::anyhow!("missing Session")),
+        };
+        stored.conversation.push(Message::user().with_text(text));
+        // Bounds reset for a user turn; history and selected context remain unchanged.
+        stored.applied_passes = 0;
+        stored.halt_reason = None;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl SessionLoader<ChatSession> for ChatRuntime {
+    async fn load(&self, session_id: &str) -> anyhow::Result<ChatSession> {
+        let sessions = self.sessions.lock().await;
+        let session = match sessions.get(session_id) {
+            Some(session) => session,
+            None => {
+                let failure = format!("no Session '{}' exists in the store", session_id);
+                return Err(anyhow::anyhow!(failure));
+            }
+        };
+        Ok(session.clone())
+    }
+}
+
+#[async_trait]
+impl EffectHandler<ChatSession, ChatEffect> for ChatRuntime {
+    async fn apply_effects(
+        &self,
+        session: &ChatSession,
+        effects: &mut [ChatEffect],
+        emit: &Emitter,
+    ) -> anyhow::Result<()> {
+        let mut sessions = self.sessions.lock().await;
+        let stored = match sessions.get_mut(session.id()) {
+            Some(stored) => stored,
+            None => {
+                let failure = format!("no Session '{}' exists in the store", session.id());
+                return Err(anyhow::anyhow!(failure));
+            }
+        };
+        let mut request_displays = Vec::new();
+        for effect in effects {
+            match effect {
+                ChatEffect::AppendMessage(message) => {
+                    stored.conversation.push(message.clone());
+                    if !message.get_tool_request_ids().is_empty() {
+                        // Display a complete saved request, not incremental argument fragments.
+                        let mut display = message.clone();
+                        display.metadata.set_operation_note(
+                            "lesson-display",
+                            "reconstructed_request",
+                            json!(true),
+                        );
+                        request_displays.push(display);
+                    }
+                }
+                ChatEffect::RecordUsage(usage) => stored.usage.push(usage.clone()),
+                ChatEffect::Halt(reason) => stored.halt_reason = Some(reason.clone()),
+            }
+        }
+        stored.applied_passes += 1;
+        // Release the store before waiting on presentation backpressure.
+        drop(sessions);
+        for display in request_displays {
+            // Same FIFO as tool results and the next inference's text Events.
+            emit.emit(AgentEvent::Message(display)).await;
+        }
+        Ok(())
+    }
+}
+
+// Inference returns complete-message and usage Effects, separate from display Events.
+enum ChatEffect {
+    AppendMessage(Message),
+    RecordUsage(ProviderUsage),
+    Halt(String),
+}
+
+impl From<Message> for ChatEffect {
+    fn from(message: Message) -> Self {
+        ChatEffect::AppendMessage(message)
+    }
+}
+
+impl InferenceEffect for ChatEffect {
+    fn record_usage(usage: ProviderUsage) -> Self {
+        ChatEffect::RecordUsage(usage)
+    }
+}
+
+impl MachineEffect for ChatEffect {
+    fn ensure_message_ids(&mut self) {
+        if let ChatEffect::AppendMessage(message) = self {
+            let with_id = message.clone().with_generated_id_if_missing();
+            *message = with_id;
+        }
+    }
+}
+
+#[derive(Default)]
+struct EventSummary {
+    message_events: usize,
+    non_text_blocks: usize,
+    saw_text: bool,
+    displayed_text: bool,
+    tool_events: Vec<Message>,
+}
+
+// This marker exists only on the presentation clone, never in saved protocol data.
+fn is_reconstructed_request_display(message: &Message) -> bool {
+    message
+        .metadata
+        .operation_note("lesson-display", "reconstructed_request")
+        == Some(&json!(true))
+}
+
+async fn display_events(receiver: mpsc::Receiver<AgentEvent>) -> io::Result<EventSummary> {
+    let mut stdout = io::stdout();
+    display_events_to(receiver, &mut stdout, stdout_color_enabled()).await
+}
+
+async fn display_events_to<W: Write>(
+    mut receiver: mpsc::Receiver<AgentEvent>,
+    output: &mut W,
+    color: bool,
+) -> io::Result<EventSummary> {
+    let mut summary = EventSummary::default();
+    while let Some(event) = receiver.recv().await {
+        match event {
+            AgentEvent::Message(message) => {
+                summary.message_events += 1;
+                if is_reconstructed_request_display(&message) {
+                    close_stream(&mut summary, output)?;
+                    for block in &message.content {
+                        if let Some(request) = block.as_tool_request() {
+                            let name = match &request.tool_call {
+                                Ok(call) => call.name.to_string(),
+                                Err(_error) => "unparseable request".to_string(),
+                            };
+                            writeln!(
+                                output,
+                                "{}",
+                                styled(
+                                    &format!(
+                                        "provider → application: calculator activity {} ({})",
+                                        request.id, name
+                                    ),
+                                    TextStyle::Magenta,
+                                    color
+                                )
+                            )?;
+                        }
+                    }
+                    summary.tool_events.push(message);
+                    continue;
+                }
+                if message.is_tool_response() {
+                    close_stream(&mut summary, output)?;
+                    for block in &message.content {
+                        if let Some(response) = block.as_tool_response() {
+                            let text = match &response.tool_result {
+                                Ok(result) => {
+                                    let mut parts = Vec::new();
+                                    for content in &result.content {
+                                        if let Some(text) = content.as_text() {
+                                            parts.push(text.text.clone());
+                                        }
+                                    }
+                                    parts.join(" ")
+                                }
+                                Err(error) => format!("rejected: {}", error.message),
+                            };
+                            writeln!(
+                                output,
+                                "{}",
+                                styled(
+                                    &format!(
+                                        "application, as the tool → provider: calculator result {}",
+                                        response.id
+                                    ),
+                                    TextStyle::Green,
+                                    color
+                                )
+                            )?;
+                            print_delimiter(output)?;
+                            writeln!(output, "{}", styled(&text, TextStyle::Green, color))?;
+                            print_delimiter(output)?;
+                        }
+                    }
+                    summary.tool_events.push(message);
+                    continue;
+                }
+                let text = message.as_concat_text();
+                for content in &message.content {
+                    if content.as_text().is_none() {
+                        summary.non_text_blocks += 1;
+                    }
+                }
+                if !text.is_empty() {
+                    if !summary.saw_text {
+                        writeln!(
+                            output,
+                            "{}",
+                            styled("Tutor (provider → application):", TextStyle::Heading, color)
+                        )?;
+                        print_delimiter(output)?;
+                        summary.saw_text = true;
+                    }
+                    summary.displayed_text = true;
+                    write!(output, "{}", text)?;
+                    output.flush()?;
+                }
+            }
+            AgentEvent::Usage(_)
+            | AgentEvent::MessageUsage { .. }
+            | AgentEvent::McpNotification(_)
+            | AgentEvent::HistoryReplaced(_) => {}
+        }
+    }
+    close_stream(&mut summary, output)?;
+    Ok(summary)
+}
+
+fn close_stream<W: Write>(summary: &mut EventSummary, output: &mut W) -> io::Result<()> {
+    if summary.saw_text {
+        writeln!(output)?;
+        print_delimiter(output)?;
+        summary.saw_text = false;
+    }
+    Ok(())
+}
+
+fn inspect_turn(session: &ChatSession, summary: &EventSummary) -> anyhow::Result<Vec<String>> {
+    if let Some(reason) = &session.halt_reason {
+        return Err(anyhow::anyhow!("run stopped at a safeguard: {}", reason));
+    }
+    let turn = messages_since_kickoff(&session.conversation)?;
+    let requests = turn_requests(turn);
+    let mut responses = Vec::new();
+    let mut warnings = Vec::new();
+    for message in turn {
+        if message.error_kind().is_some()
+            || message.as_concat_text()
+                == "The model returned an empty response. Please resend your message to continue."
+        {
+            return Err(anyhow::anyhow!(
+                "saved inference diagnostic; inspect session-output.md"
+            ));
+        }
+        for block in &message.content {
+            if let Some(response) = block.as_tool_response() {
+                responses.push(response);
+                if response.tool_result.is_err() {
+                    warnings.push(format!(
+                        "Calculator request {} was rejected; see session-output.md.",
+                        response.id
+                    ));
+                }
+            }
+        }
+    }
+    let last = match turn.last() {
+        Some(last) => last,
+        None => return Err(anyhow::anyhow!("missing turn")),
+    };
+    if !summary.displayed_text
+        || last.role != rmcp::model::Role::Assistant
+        || last.as_concat_text().trim().is_empty()
+        || !last.get_tool_request_ids().is_empty()
+    {
+        return Err(anyhow::anyhow!(
+            "no ordinary final tutor answer was both displayed and saved"
+        ));
+    }
+    let mut ids = HashSet::new();
+    for request in &requests {
+        if request.id.is_empty() || !ids.insert(request.id.as_str()) {
+            return Err(anyhow::anyhow!("ambiguous request correlation ID"));
+        }
+        let matches = responses
+            .iter()
+            .filter(|response| response.id == request.id)
+            .count();
+        if matches != 1 {
+            return Err(anyhow::anyhow!(
+                "request {} lacks exactly one saved correlated response",
+                request.id
+            ));
+        }
+    }
+    if responses.len() != requests.len() {
+        return Err(anyhow::anyhow!("unmatched saved tool response"));
+    }
+    // Tool selection and teaching quality require human review, not a forced script.
+    Ok(warnings)
+}
+
+// The typed domain shape remains LossArguments; this provider reuses Lesson 6 validation.
+struct LossToolProvider;
+
+#[async_trait]
+impl ToolProvider<ChatSession> for LossToolProvider {
+    async fn tools(&self, _session: &ChatSession) -> anyhow::Result<Vec<Tool>> {
+        Ok(vec![tool_definition()])
+    }
+
+    async fn call(
+        &self,
+        _session: &ChatSession,
+        _request_id: &str,
+        call: CallToolRequestParams,
+        _emit: &Emitter,
+    ) -> Result<CallToolResult, ErrorData> {
+        execute_allowed_tool(&Ok(call))
+    }
+}
+
+// The shipped operation skips unknown names and has no request bound.
+// Answer rejected calls first; on re-evaluation the shipped operation dispatches the rest.
+struct SafeTools {
+    inner: ToolOperation<ChatSession>,
+}
+
+#[async_trait]
+impl Operation<ChatSession, ChatEffect> for SafeTools {
+    fn name(&self) -> &'static str {
+        "tools"
+    }
+
+    async fn inference_tools(&self, session: &ChatSession) -> anyhow::Result<Vec<Tool>> {
+        <ToolOperation<ChatSession> as Operation<ChatSession, ChatEffect>>::inference_tools(
+            &self.inner,
+            session,
+        )
+        .await
+    }
+
+    async fn prompt_parts(
+        &self,
+        session: &ChatSession,
+        _conversation: &Conversation,
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        Ok(session.lesson.prompt_parts())
+    }
+
+    async fn run(
+        &self,
+        session: &ChatSession,
+        conversation: &Conversation,
+        emit: &Emitter,
+    ) -> anyhow::Result<OperationResult<ChatEffect>> {
+        let turn = messages_since_kickoff(conversation)?;
+        let requests = turn_requests(turn);
+        let mut seen = HashSet::new();
+        for request in &requests {
+            if request.id.is_empty() || !seen.insert(request.id.as_str()) {
+                let failure = "empty or duplicate correlation ID; cannot safely correlate results"
+                    .to_string();
+                return yielded_with([ChatEffect::Halt(failure)]);
+            }
+        }
+        let mut answered = HashSet::new();
+        for message in turn {
+            for id in message.get_tool_response_ids() {
+                answered.insert(id);
+            }
+        }
+        let mut rejected = Message::user();
+        for (index, request) in requests.iter().enumerate() {
+            if answered.contains(request.id.as_str()) || request.was_executed_externally() {
+                continue;
+            }
+            let failure = if index >= MAX_TOOL_REQUESTS {
+                Some(format!(
+                    "request limit is {} per user turn; this request was not executed",
+                    MAX_TOOL_REQUESTS
+                ))
+            } else {
+                match &request.tool_call {
+                    Ok(call) => {
+                        if call.name.as_ref() != TOOL_NAME {
+                            Some(format!(
+                                "unknown tool '{}'; only '{}' is allowed",
+                                call.name, TOOL_NAME
+                            ))
+                        } else {
+                            None
+                        }
+                    }
+                    // The SDK returns correlated parse errors itself.
+                    Err(_error) => None,
+                }
+            };
+            if let Some(failure) = failure {
+                rejected.add_tool_response_with_metadata(
+                    request.id.clone(),
+                    Err(ErrorData::invalid_params(failure, None)),
+                    request.metadata.as_ref(),
+                );
+            }
+        }
+        if !rejected.content.is_empty() {
+            let response = emit.message(rejected).await;
+            return applied([ChatEffect::from(response)]);
+        }
+        <ToolOperation<ChatSession> as Operation<ChatSession, ChatEffect>>::run(
+            &self.inner,
+            session,
+            conversation,
+            emit,
+        )
+        .await
+    }
+}
+
+fn turn_requests(messages: &[Message]) -> Vec<&ToolRequest> {
+    let mut requests = Vec::new();
+    for message in messages {
+        for block in &message.content {
+            if let Some(request) = block.as_tool_request() {
+                requests.push(request);
+            }
+        }
+    }
+    requests
+}
+
+// Count applied batches, not Events or messages. Normal completion wins over the cap.
+struct RunLimit;
+
+#[async_trait]
+impl Operation<ChatSession, ChatEffect> for RunLimit {
+    fn name(&self) -> &'static str {
+        "run-limit"
+    }
+
+    async fn run(
+        &self,
+        session: &ChatSession,
+        conversation: &Conversation,
+        _emit: &Emitter,
+    ) -> anyhow::Result<OperationResult<ChatEffect>> {
+        let turn = messages_since_kickoff(conversation)?;
+        let requests = turn_requests(turn);
+        let mut answered = HashSet::new();
+        for message in turn {
+            for id in message.get_tool_response_ids() {
+                answered.insert(id);
+            }
+        }
+        let all_answered = requests
+            .iter()
+            .all(|request| answered.contains(request.id.as_str()));
+        if requests.len() > MAX_TOOL_REQUESTS && all_answered {
+            return yielded_with([ChatEffect::Halt(format!(
+                "model exceeded {} requests; excess requests received errors",
+                MAX_TOOL_REQUESTS,
+            ))]);
+        }
+        let finished = goose_agent::operation::ends_turn(turn) && all_answered;
+        if session.applied_passes >= MAX_APPLIED_PASSES && !finished {
+            return yielded_with([ChatEffect::Halt(format!(
+                "reached {} applied passes",
+                MAX_APPLIED_PASSES,
+            ))]);
+        }
+        not_applicable()
+    }
+}
+
+// Terminal styling is presentation only; redirected transcripts contain no ANSI codes.
